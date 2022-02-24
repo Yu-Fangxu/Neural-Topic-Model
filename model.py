@@ -1,3 +1,4 @@
+   
 import numpy as np
 from collections import Counter
 from tqdm import tqdm
@@ -7,13 +8,14 @@ from sklearn.feature_extraction.text import CountVectorizer
 import torch
 import torch.nn as nn
 from torch.distributions import LogNormal, Dirichlet, kl_divergence
+
 import torch.nn.functional as F
 # dataset = "mr"
 # BoW = np.load(f"temp/{dataset}.BoW.npy")
 # BoW = BoW[:1000]
 # print(BoW.shape)
 news = fetch_20newsgroups(subset='all')
-vectorizer = CountVectorizer(max_df=0.5, min_df=100, stop_words='english')
+vectorizer = CountVectorizer(max_df=0.5, min_df=20, stop_words='english')
 docs = torch.from_numpy(vectorizer.fit_transform(news['data']).toarray())
 
 vocab = pd.DataFrame(columns=['word', 'index'])
@@ -21,55 +23,6 @@ vocab['word'] = vectorizer.get_feature_names()
 vocab['index'] = vocab.index
 # print('Dictionary size: %d' % len(vocab))
 # print('Corpus size: {}'.format(docs.shape))
-class PLSA:
-    def __init__(self, X, K, words, iters=3):
-        """
-        :param X: word-doc矩阵
-        :param K: 设定的topic数
-        :param words: 单词列表
-        :param iters: 迭代次数
-        """
-
-        self.N, self.M = X.shape
-
-        self.X = X.T
-        self.K = K
-        self.iters = iters
-        self.P_wi_zk = np.random.rand(self.K, self.M)
-        self.P_zk_dj = np.random.rand(self.N, self.K)
-        self.P_zk_wi_dj = np.zeros((self.M, self.N, self.K))
-        for k in range(self.K):
-            self.P_wi_zk[k] /= np.sum(self.P_wi_zk[k])
-
-        for n in range(self.N):
-            self.P_zk_dj[n] /= np.sum(self.P_zk_dj[n])
-
-    def calc(self):
-        for i in tqdm(range(self.iters)):
-            for m in range(self.M):
-                for n in range(self.N):
-                    sums = 1e-4
-                    for k in range(self.K):
-                        self.P_zk_wi_dj[m, n, k] = self.P_wi_zk[k, m] * self.P_zk_dj[n, k]  #计算P(zk|wi,dj)的分子部分，即P(wi|zk)*P(zk|dj)
-                        sums += self.P_zk_wi_dj[m, n, k]  #计算P(zk|wi,dj)的分母部分，即P(wi|zk)*P(zk|dj)在K个话题上的总和
-                    self.P_zk_wi_dj[m, n, :] = self.P_zk_wi_dj[m, n, :] / sums  #得到单词-文本对(wi,dj)条件下的P(zk|wi,dj)
-        #执行M步，计算P(wi|zk)
-            for k in range(self.K):
-                s1 = 1e-4
-                for m in range(self.M):
-                    self.P_wi_zk[k, m] = 0
-                    for n in range(self.N):
-                        self.P_wi_zk[k, m] += self.X[m, n] * self.P_zk_wi_dj[m, n, k]  #计算P(wi|zk)的分子部分，即n(wi,dj)*P(zk|wi,dj)在N个文本上的总和，其中n(wi,dj)为单词-文本矩阵X在文本对(wi,dj)处的频次
-                    s1 += self.P_wi_zk[k, m]  #计算P(wi|zk)的分母部分，即n(wi,dj)*P(zk|wi,dj)在N个文本和M个单词上的总和
-                self.P_wi_zk[k, :] = self.P_wi_zk[k, :] / s1  #得到话题zk条件下的P(wi|zk)
-        #执行M步，计算P(zk|dj)
-            for n in range(self.N):
-                for k in range(self.K):
-                    self.P_zk_dj[n, k] = 0
-                    for m in range(self.M):
-                        self.P_zk_dj[n, k] += self.X[m, n] * self.P_zk_wi_dj[m, n, k]  #同理计算P(zk|dj)的分子部分，即n(wi,dj)*P(zk|wi,dj)在N个文本上的总和
-                    self.P_zk_dj[n, k] = self.P_zk_dj[n, k] / np.sum(self.X[:, n])  #得到文本dj条件下的P(zk|dj)，其中n(dj)为文本dj中的单词个数，由于我们只取了出现频次前1000的单词，所以这里n(dj)计算的是文本dj中在单词列表中的单词数
-        return self.P_wi_zk, self.P_zk_dj
 
 class NVDM(nn.Module):
     '''Implementation of the NVDM model as described in `Neural Variational Inference for
@@ -106,7 +59,7 @@ class NVDM(nn.Module):
         for _ in range(hidden_layers - 1):
             mlp_layers.append(nn.Linear(hidden_size, hidden_size))
             mlp_layers.append(nonlinearity())
-
+        
         self.mlp = nn.Sequential(*mlp_layers)
         self.mlp.apply(NVDM._param_initializer)
 
@@ -121,14 +74,25 @@ class NVDM(nn.Module):
 
         self.dec_projection = nn.Linear(num_topics, vocab_size)
         self.log_softmax = nn.LogSoftmax(-1)
+        
+        self.bn = nn.BatchNorm1d(num_topics)
+        self.drop = nn.Dropout(0.2)
+    def encode(self, input_bows):
+        pi = self.mlp(input_bows)
+        pi = self.drop(pi)
+        # Use this to get mean, log_sig for Gaussian
+        mean = self.bn(self.mean(pi))
+        log_sigma = self.bn(self.log_sigma(pi))
+        return mean, log_sigma
+
+    def decode(self, sample):
+        return self.dec_projection(sample)
 
     def forward(self, input_bows):
         # Run BOW through MLP
-        pi = self.mlp(input_bows)
-
+        
         # Use this to get mean, log_sig for Gaussian
-        mean = self.mean(pi)
-        log_sigma = self.log_sigma(pi)
+        mean, log_sigma = self.encode(input_bows)
 
         # Calculate KLD
         kld = -0.5 * torch.sum(1 - torch.square(mean) +
@@ -140,20 +104,20 @@ class NVDM(nn.Module):
         epsilons = torch.normal(0, 1, size=(
             input_bows.size()[0], self.num_topics)).to(input_bows.device)
         sample = (torch.exp(log_sigma) * epsilons) + mean
-
+        sample = self.drop(sample)
         # Softmax to get p(v_i | h_tm), AKA probabilities of words given hidden state
-        logits = self.log_softmax(self.dec_projection(sample))
+        logits = self.log_softmax(self.decode(sample))
 
         # Lowerbound on NVDM true loss, used for optimization
         rec_loss = -1 * torch.sum(logits * input_bows, 1)
-        
+
         # loss_nvdm_lb = torch.mean(rec_loss + kld)
         # rec_loss = torch.sum(rec_loss. dim=1) / input_bows.shape[0]
         
         # rec_loss = torch.mean(rec_loss)
         # kld = torch.mean(kld)
         return sample, logits, kld, rec_loss# loss_nvdm_lb
-        
+
 class ProdLDA(nn.Module):
     def __init__(self, vocab_size, num_topics=50, hidden_size=100, hidden_layers=2, nonlinearity=nn.Softplus):
         super().__init__()
@@ -178,14 +142,29 @@ class ProdLDA(nn.Module):
         
         self.dec_projection = nn.Linear(num_topics, vocab_size)
         self.log_softmax = nn.LogSoftmax(-1)
-    def forward(self, input_bows):
+        
+        self.bn = nn.BatchNorm1d(num_topics)
+        self.drop = nn.Dropout(0.2)
+    def encode(self, input_bows):
         h = self.mlp(input_bows)
+        h = self.drop(h)
+        return h
+
+    def reparameterize(self, h):
         alpha = self.h2t[1](self.h2t[0](h)).exp()
         posterior = Dirichlet(alpha.cpu())
         if self.training:
             sample = posterior.rsample().cuda()
         else:
             sample = posterior.mean().cuda()
+        return sample, posterior
+
+    def decode(self, sample):
+        return self.dec_projection(sample)
+
+    def forward(self, input_bows):
+        h = self.encode(input_bows)
+        sample, posterior = self.reparameterize(h)
         
         # mean = self.mean(h)
         # log_sigma = self.log_sigma(h)
@@ -193,8 +172,8 @@ class ProdLDA(nn.Module):
         # input_bows.size()[0], self.num_topics)).to(input_bows.device)
         
         # sample = (torch.exp(log_sigma) * epsilons) + mean
-        
-        logits = self.log_softmax(self.dec_projection(sample))
+        sample = self.drop(sample)
+        logits = self.log_softmax(self.decode(sample))
         rec_loss = -1 * torch.sum(logits * input_bows, 1)
         #下面计算KLD
         
